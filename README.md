@@ -10,11 +10,12 @@ Terraform provider for managing NATS JWT authentication tokens and related resou
 - Support for bearer tokens and response permissions
 - Account resource limits (connections, data, payload, subscriptions)
 - JetStream limits configuration (storage, streams, consumers)
+- Account imports and exports for cross-account communication
+- Account-level subject mappings, including weighted destinations and mapping functions such as `partition`
 - Automatic generation of user credential files
 
 ### Future Enhancements
 
-- **Account Imports/Exports**: Support for cross-account communication
 - **Signing Key Management**: Key rotation and revocation support
 - **File-based Resolver**: Support for file-based JWT resolution
 

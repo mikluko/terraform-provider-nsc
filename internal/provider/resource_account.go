@@ -7,11 +7,15 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-timetypes/timetypes"
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/nats-io/jwt/v2"
@@ -49,6 +53,17 @@ type ImportModel struct {
 	Type         types.String `tfsdk:"type"`
 	Share        types.Bool   `tfsdk:"share"`
 	AllowTrace   types.Bool   `tfsdk:"allow_trace"`
+}
+
+type MappingModel struct {
+	Subject      types.String `tfsdk:"subject"`
+	Destinations types.List   `tfsdk:"destination"`
+}
+
+type MappingDestinationModel struct {
+	Subject types.String `tfsdk:"subject"`
+	Weight  types.Int64  `tfsdk:"weight"`
+	Cluster types.String `tfsdk:"cluster"`
 }
 
 type AccountResourceModel struct {
@@ -89,9 +104,10 @@ type AccountResourceModel struct {
 	MaxDiskStreamBytes   types.Int64 `tfsdk:"max_disk_stream_bytes"`
 	MaxBytesRequired     types.Bool  `tfsdk:"max_bytes_required"`
 
-	// Imports/Exports
-	Exports types.List `tfsdk:"export"`
-	Imports types.List `tfsdk:"import"`
+	// Imports/Exports/Mappings
+	Exports  types.List `tfsdk:"export"`
+	Imports  types.List `tfsdk:"import"`
+	Mappings types.List `tfsdk:"mapping"`
 
 	JWT       types.String `tfsdk:"jwt"`
 	PublicKey types.String `tfsdk:"public_key"`
@@ -361,6 +377,44 @@ func (r *AccountResource) Schema(ctx context.Context, req resource.SchemaRequest
 						"allow_trace": schema.BoolAttribute{
 							Optional:            true,
 							MarkdownDescription: "Allow tracing for this import",
+						},
+					},
+				},
+			},
+			"mapping": schema.ListNestedBlock{
+				MarkdownDescription: "Account-level subject mappings. The server rewrites every message published in this account whose subject matches a mapping's source before any stream, import or export sees it, so a mapped source is the only form the rest of the account observes.",
+				NestedObject: schema.NestedBlockObject{
+					Attributes: map[string]schema.Attribute{
+						"subject": schema.StringAttribute{
+							Required:            true,
+							MarkdownDescription: "Source subject pattern; each source may appear in one mapping block",
+						},
+					},
+					Blocks: map[string]schema.Block{
+						"destination": schema.ListNestedBlock{
+							MarkdownDescription: "Subjects the source is rewritten to. Weights across a source's destinations sum to at most 100; a destination with no weight takes 100.",
+							Validators: []validator.List{
+								listvalidator.SizeAtLeast(1),
+							},
+							NestedObject: schema.NestedBlockObject{
+								Attributes: map[string]schema.Attribute{
+									"subject": schema.StringAttribute{
+										Required:            true,
+										MarkdownDescription: "Destination subject; may reference the source's wildcards as `{{wildcard(n)}}` and derive tokens from them with mapping functions such as `{{partition(n,m)}}`",
+									},
+									"weight": schema.Int64Attribute{
+										Optional: true,
+										Validators: []validator.Int64{
+											int64validator.Between(1, 100),
+										},
+										MarkdownDescription: "Share of the source's traffic (1-100) routed to this destination; omitted means 100",
+									},
+									"cluster": schema.StringAttribute{
+										Optional:            true,
+										MarkdownDescription: "Apply this destination only to publishers connected to the named cluster",
+									},
+								},
+							},
 						},
 					},
 				},
@@ -750,6 +804,11 @@ func (r *AccountResource) Create(ctx context.Context, req resource.CreateRequest
 		}
 	}
 
+	resp.Diagnostics.Append(applyMappings(ctx, data.Mappings, accountClaims)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	// Add signing keys if provided
 	if !data.SigningKeys.IsNull() && !data.SigningKeys.IsUnknown() {
 		var signingKeys []string
@@ -1124,6 +1183,11 @@ func (r *AccountResource) Update(ctx context.Context, req resource.UpdateRequest
 		}
 	}
 
+	resp.Diagnostics.Append(applyMappings(ctx, data.Mappings, accountClaims)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	// Add signing keys if provided
 	if !data.SigningKeys.IsNull() && !data.SigningKeys.IsUnknown() {
 		var signingKeys []string
@@ -1172,4 +1236,66 @@ func (r *AccountResource) Delete(ctx context.Context, req resource.DeleteRequest
 
 	// Nothing to clean up - all data is in state
 	tflog.Trace(ctx, "deleted account resource")
+}
+
+// applyMappings adds the configured mapping blocks to the account claims and
+// validates them with nats-jwt's own rules.
+//
+// A destination with no weight is stored as weight 0, which nats-jwt reads as
+// 100. Encoding the claims validates nothing, so the weight sum per source and
+// the subject syntax are checked here, through the validator nsc itself runs,
+// and a rejected mapping is a diagnostic rather than a JWT the server refuses.
+// A source named by two blocks is refused too: the claims hold one destination
+// list per source, and the second block would silently replace the first.
+func applyMappings(ctx context.Context, list types.List, claims *jwt.AccountClaims) diag.Diagnostics {
+	var diags diag.Diagnostics
+	if list.IsNull() || list.IsUnknown() || len(list.Elements()) == 0 {
+		return diags
+	}
+
+	var mappings []MappingModel
+	diags.Append(list.ElementsAs(ctx, &mappings, false)...)
+	if diags.HasError() {
+		return diags
+	}
+
+	for _, mapping := range mappings {
+		source := jwt.Subject(mapping.Subject.ValueString())
+		if _, exists := claims.Mappings[source]; exists {
+			diags.AddError(
+				"Duplicate mapping source",
+				fmt.Sprintf("Subject %q appears in more than one mapping block; declare every destination for a source in one block.", source),
+			)
+			return diags
+		}
+
+		var destinations []MappingDestinationModel
+		diags.Append(mapping.Destinations.ElementsAs(ctx, &destinations, false)...)
+		if diags.HasError() {
+			return diags
+		}
+
+		to := make([]jwt.WeightedMapping, 0, len(destinations))
+		for _, destination := range destinations {
+			weighted := jwt.WeightedMapping{
+				Subject: jwt.Subject(destination.Subject.ValueString()),
+			}
+			if !destination.Weight.IsNull() {
+				weighted.Weight = uint8(destination.Weight.ValueInt64())
+			}
+			if !destination.Cluster.IsNull() {
+				weighted.Cluster = destination.Cluster.ValueString()
+			}
+			to = append(to, weighted)
+		}
+		claims.AddMapping(source, to...)
+	}
+
+	var results jwt.ValidationResults
+	claims.Mappings.Validate(&results)
+	for _, err := range results.Errors() {
+		diags.AddError("Invalid mapping", err.Error())
+	}
+
+	return diags
 }

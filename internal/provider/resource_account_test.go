@@ -7,6 +7,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	"github.com/nats-io/jwt/v2"
 )
 
 func TestAccAccountResource_basic(t *testing.T) {
@@ -191,6 +192,201 @@ func TestAccAccountResource_withImports(t *testing.T) {
 			},
 		},
 	})
+}
+
+func TestAccAccountResource_withMappings(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccAccountResourceConfigWithMappings(90, 10),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("nsc_account.test", "name", "MappingAccount"),
+					resource.TestCheckResourceAttr("nsc_account.test", "mapping.#", "2"),
+					resource.TestCheckResourceAttr("nsc_account.test", "mapping.0.subject", "orders.*"),
+					resource.TestCheckResourceAttr("nsc_account.test", "mapping.0.destination.#", "1"),
+					resource.TestCheckResourceAttr("nsc_account.test", "mapping.0.destination.0.subject", "orders.{{wildcard(1)}}.{{partition(16,1)}}"),
+					resource.TestCheckNoResourceAttr("nsc_account.test", "mapping.0.destination.0.weight"),
+					resource.TestCheckResourceAttr("nsc_account.test", "mapping.1.subject", "requests.search"),
+					resource.TestCheckResourceAttr("nsc_account.test", "mapping.1.destination.#", "2"),
+					resource.TestCheckResourceAttr("nsc_account.test", "mapping.1.destination.0.weight", "90"),
+					resource.TestCheckResourceAttr("nsc_account.test", "mapping.1.destination.1.weight", "10"),
+					testAccCheckAccountJWTMappings("nsc_account.test", map[string][]jwt.WeightedMapping{
+						"orders.*": {
+							{Subject: "orders.{{wildcard(1)}}.{{partition(16,1)}}"},
+						},
+						"requests.search": {
+							{Subject: "requests.search.stable", Weight: 90},
+							{Subject: "requests.search.canary", Weight: 10},
+						},
+					}),
+				),
+			},
+			// Update the weights and confirm the re-signed JWT carries them
+			{
+				Config: testAccAccountResourceConfigWithMappings(50, 50),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("nsc_account.test", "mapping.1.destination.0.weight", "50"),
+					resource.TestCheckResourceAttr("nsc_account.test", "mapping.1.destination.1.weight", "50"),
+					testAccCheckAccountJWTMappings("nsc_account.test", map[string][]jwt.WeightedMapping{
+						"orders.*": {
+							{Subject: "orders.{{wildcard(1)}}.{{partition(16,1)}}"},
+						},
+						"requests.search": {
+							{Subject: "requests.search.stable", Weight: 50},
+							{Subject: "requests.search.canary", Weight: 50},
+						},
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccAccountResource_rejectsOverweightMappings(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccAccountResourceConfigWithMappings(90, 20),
+				ExpectError: regexp.MustCompile(`exceeds 100%`),
+			},
+		},
+	})
+}
+
+func TestAccAccountResource_rejectsDuplicateMappingSource(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccAccountResourceConfigWithDuplicateMappingSource(),
+				ExpectError: regexp.MustCompile(`Duplicate mapping source`),
+			},
+		},
+	})
+}
+
+func testAccAccountResourceConfigWithMappings(stableWeight, canaryWeight int) string {
+	return fmt.Sprintf(`
+resource "nsc_nkey" "operator" {
+  type = "operator"
+}
+
+resource "nsc_nkey" "account" {
+  type = "account"
+}
+
+resource "nsc_operator" "test" {
+  name        = "TestOperator"
+  subject     = nsc_nkey.operator.public_key
+  issuer_seed = nsc_nkey.operator.seed
+}
+
+resource "nsc_account" "test" {
+  name        = "MappingAccount"
+  subject     = nsc_nkey.account.public_key
+  issuer_seed = nsc_nkey.operator.seed
+
+  mapping {
+    subject = "orders.*"
+    destination {
+      subject = "orders.{{wildcard(1)}}.{{partition(16,1)}}"
+    }
+  }
+
+  mapping {
+    subject = "requests.search"
+    destination {
+      subject = "requests.search.stable"
+      weight  = %[1]d
+    }
+    destination {
+      subject = "requests.search.canary"
+      weight  = %[2]d
+    }
+  }
+}
+`, stableWeight, canaryWeight)
+}
+
+func testAccAccountResourceConfigWithDuplicateMappingSource() string {
+	return `
+resource "nsc_nkey" "operator" {
+  type = "operator"
+}
+
+resource "nsc_nkey" "account" {
+  type = "account"
+}
+
+resource "nsc_operator" "test" {
+  name        = "TestOperator"
+  subject     = nsc_nkey.operator.public_key
+  issuer_seed = nsc_nkey.operator.seed
+}
+
+resource "nsc_account" "test" {
+  name        = "MappingAccount"
+  subject     = nsc_nkey.account.public_key
+  issuer_seed = nsc_nkey.operator.seed
+
+  mapping {
+    subject = "orders.*"
+    destination {
+      subject = "orders.{{wildcard(1)}}.a"
+    }
+  }
+
+  mapping {
+    subject = "orders.*"
+    destination {
+      subject = "orders.{{wildcard(1)}}.b"
+    }
+  }
+}
+`
+}
+
+// testAccCheckAccountJWTMappings decodes the account JWT in state and checks the
+// mappings it carries against want, source by source and destination by
+// destination, comparing weights as nats-jwt reads them.
+func testAccCheckAccountJWTMappings(resourceName string, want map[string][]jwt.WeightedMapping) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[resourceName]
+		if !ok {
+			return fmt.Errorf("Resource not found: %s", resourceName)
+		}
+
+		claims, err := jwt.DecodeAccountClaims(rs.Primary.Attributes["jwt"])
+		if err != nil {
+			return fmt.Errorf("decode account JWT: %w", err)
+		}
+		if len(claims.Mappings) != len(want) {
+			return fmt.Errorf("JWT carries %d mapping sources, want %d", len(claims.Mappings), len(want))
+		}
+
+		for source, destinations := range want {
+			got, ok := claims.Mappings[jwt.Subject(source)]
+			if !ok {
+				return fmt.Errorf("JWT carries no mapping for source %q", source)
+			}
+			if len(got) != len(destinations) {
+				return fmt.Errorf("mapping %q carries %d destinations, want %d", source, len(got), len(destinations))
+			}
+			for i := range destinations {
+				if got[i].Subject != destinations[i].Subject ||
+					got[i].GetWeight() != destinations[i].GetWeight() ||
+					got[i].Cluster != destinations[i].Cluster {
+					return fmt.Errorf("mapping %q destination %d is %+v, want %+v", source, i, got[i], destinations[i])
+				}
+			}
+		}
+		return nil
+	}
 }
 
 func testAccAccountResourceConfig(name string) string {
